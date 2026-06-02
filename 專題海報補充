@@ -1,0 +1,145 @@
+# 專題講稿：An Efficient Winograd-Based CNN Accelerator on FPGA
+
+**專題題目：** An Efficient Winograd-Based CNN Accelerator on FPGA
+**硬體平台：** PYNQ-Z2 FPGA
+**整體設計：** 針對 VGG-16 做硬體加速，並使用 INT8 量化來降低運算與記憶體成本。
+
+**實驗結果 (Tiny ImageNet 測試集)：**
+
+* **18.89 FPS** 
+* **47.33 GOPS**
+* **clock 166mhz**
+* 相較於 FP32 baseline，準確率**只下降 0.51%**
+
+---
+
+## 1. Software Processing & Scheduling（左欄上半）
+
+### Step 1：Operator Folding (算子折疊)
+
+> 「我把 Conv 跟 BatchNorm 融合成單一 conv layer。BN 在訓練時是 `(x−μ)/σ × γ + β`，推論時這四個都是常數，可以直接折進 conv 的 weight 跟 bias。」
+
+### Step 2：Offline Winograd Transform
+
+> 「因為 weight 已知，所以能先 transform 好——硬體只看到 4×4 weight，runtime 不用做 weight transform，代價是傳的資料量變大。」
+
+### Step 3：Hardware-Aware PTQ (Hardware-Aware Post-Training Quantization)
+
+我們採用 Per-Channel INT8 量化，每個 Output Channel 皆擁有獨立的 Scale。透過 500 張影像的校正集 (Calibration Set) 統計最大最小值，以決定最佳的 Scale 參數。
+
+累積器 (ACC) 算出的結果必須透過公式 `ACC * (S_in * S_w / S_next)` 進行再量化。將這個浮點數 Scale 近似為一組「整數乘數 (Multiplier)」與「位移量 (Shift)」，也就是 `ACC * mult >> shift`。
+
+### Step 4：Hardware-Aligned Packing
+
+* **16-channel aligned：** 硬體 1 個 chunk 處理 16 個 output channel，weight 補成 16 倍數。
+* **Asymmetric padding：** 特徵圖 (FM) 兩側補 1 圈 0 變 `(W+2)×(H+2)`，再向上補齊 4 倍數讓 Winograd tile 整齊。
+* **Build layer template (C code)：**
+> 「為了消除 Runtime 時 CPU 重組資料的延遲，我們在初始化時，就用 C code 把這些對齊好的 Weight、PARAM、以及 Padding 區塊，在 DDR 的 TX Buffer 中排布成一個一體化、連續的二進位樣板 (Layer Template)。在實際運行推論時，CPU 只需要將新輸入的圖片數據直接複寫到樣板預留的 Image 區塊中。」
+
+
+---
+
+## 2. Static Staggered Scheduling
+
+**目的：** 減少 FPGA 等待 CPU pack 時間。A 比 B 領先一層，讓兩張 image 在不同 layer 上錯開——CPU 永遠在 pack/unpack，並減少 FPGA IDLE。
+
+### 為什麼要 Unpack？
+
+FPGA 算完一層後，吐出來的資料依然是為了 16-Channel 還有 Winograd 對齊硬補了一堆 0 的格式。CPU 必須把這些無效的 0 砍掉，才能拿到正確的 Output。
+
+### 為什麼用 Staggered 也遮不了 Unpack 的延遲？
+
+Pack 跟 Unpack 的差別在「buffer 何時 ready」：
+
+* **Pack 可以遮：** CPU 寫 TX buffer，FPGA 之後讀。Buffer 只要在 launch_dma 前 ready 就好——所以 CPU pack(B) 可以跟 FPGA compute(A) 平行。
+* **Unpack 沒法遮：** 是因為 CPU 和 FPGA 共用同一塊 RX Buffer。當 Output FIFO 排空，CPU 終於開始讀取 RX Buffer 進行 Unpack 時。因為 Buffer 正在被 CPU 佔用，FPGA 只能被迫 IDLE 了。
+
+---
+
+## 3. Overall Hardware Architecture（左欄下半）
+
+CMD decoder 看每筆資料前面的 header，分發到 PARAM bank、WEIGHT bank、FM bank、Global Cache。所有 bank 都是 dual-bank ping-pong——bank 0 算的同時，bank 1 載下個 input channal。
+
+### 封包格式
+
+DMA 用 AXI-Stream 128-bit。一個 layer 由多個 chunk 組成，每個 chunk 對每個 input channel 送一個 packet。每個 packet 分 4 段（每段都有自己的 opcode header）：
+
+* **PARAM header + 6 beats**（16 PE × 40-bit param + padding）
+* **WEIGHT header + 16 beats**（16 PE × 4×4 INT8 weight）
+* **CMD header**（1 beat 本身就是控制訊號：acc_mode / relu_en / pool_en）
+* **FM payload**
+
+---
+
+## 4. Hardware Architecture（右欄上半）
+
+*(重點：Shared Input Transform + Sliding Window + Tile FIFO Toggle)*
+
+Tile generate(Sliding window) 當蓄水期結束，同一 cycle 同時吐 2個 tile（左半 A + 右半 B），但下游 Input Transform 一拍只能處理 1 個。所以用 2 個 FIFO 同時接這 2 個 tile，下游 toggle 輪流讀，保持 B→A 順序、不丟資料。
+
+### PE 內部 10 級 Pipeline
+
+| Cycle (拍) | 控制訊號 (Valid) | 運算內容 (Operations) |
+| --- | --- | --- |
+| **1** | val_1 | 接收廣播的 V 並鎖存 |
+| **2** | val_2 | Element-wise mul V × W |
+| **3** | val_3 | A^T reduction (Column reduction) |
+| **4** | val_4 | Row reduction & 讀取 Psum BRAM |
+| **5** | val_5 | 跨通道累加 (Accumulate) & 寫回 BRAM |
+| **6** | val_6 | 加上 Bias 與 ReLU |
+| **7** | val_7 | Requantization (乘法段) |
+| **8** | val_8 | Requantization (Shift >>> + Clip 截斷) |
+| **9** | val_9 | 第一層 MaxPool (L1 比較) |
+| **10** | valid_out | 第二層 MaxPool (L2 比較) & 寫入 Output FIFO |
+
+### 4-lane Output FIFO
+
+> 「16 PE 同時吐 output 太寬，拆 4 個 lane FIFO 平行收（每 lane 收 4 PE）。」
+
+---
+
+## 5. Performance Analysis（右欄中半）
+
+### Software Scheduling Strategy 表
+
+> 「三段優化結果：Sequential 12.6 → Staggered 17.3 → +Cache 18.9 FPS，總共 +49% throughput。」
+
+### VGG-16 Bandwidth Reduction 圖
+
+> 「Cache 設計的效果：FM traffic 從 17,582 KB 降到 4,669 KB，省 73.4%。Total DMA 從 44.8 MB 降到 31.9 MB，省 28.8%。Weight 沒變因為 weight 不能 cache（每個 chunk 的 weight 不同）。」
+
+### Layer-wise Bottleneck 折線圖 (Memory Wall 故事核心)
+
+One-shot 整層的所有 chunk 預先打包成一段連續的 TX buffer，DMA 一筆 launch 全部送進去。
+*藍線是 GOPS、紅線是 DMA bandwidth。*
+
+* **FPGA 時間:** `launch_dma` 到 `wait_dma`
+* `launch_dma`: CPU 對 DMA 控制器下達傳輸指令
+* `wait_dma`: CPU 等待 DMA 回報傳輸完成
+
+* **DMA_bytes:** 該次傳輸的總資料量（位元組）
+* `DMA_bytes = weight + FM_payload + headers
+
+* **GOPS** = `2 × MACs / FPGA_time`
+* `MACs = out_h × out_w × in_ch × out_ch × 9` (standard 3×3 conv)
+
+* **BW (MB/s)** = `DMA_bytes / FPGA_time`
+
+**分析結論：**
+
+* **L1 (GOPS 159、BW 662 MB/s)：** tile 多、chunk overhead 攤平，屬於 compute-bound。
+* **L10-12 (GOPS 21、BW 1325 MB/s)：** 只有 4 個 tile，chunk reload overhead 吃掉計算時間，屬於 memory-bound。
+
+### VGG vs RepVGG(Opt) + Bottleneck 段
+
+> 「VGG 後段卡 memory wall，所以我也測了 RepVGG(Opt)。RepVGG 的 channel-balanced 設計讓 deep layer 維持 16×16 而不是 4×4，PE 利用率回升。結果：+10% FPS、+20% GOPS，accuracy drop 2.57%(量化沒有特殊處哩，找scale有些被壓成0)。」
+
+---
+
+## 6. Project Result（對照表）
+
+> 「右下 5 篇對照組。[1] 是 Z045 高階平台，。[2][3][4] 都是同 Z020 平台：
+>  W是Vivado報告，而非實際測量
+>  [2] 那欄 GOPS 84.3 (conv) 只算 conv layer 不含 system overhead，跟我 system 47.33 不是同 metric。」
+
+---
